@@ -3,16 +3,18 @@ package webhook.support;
 import lombok.extern.slf4j.Slf4j;
 import webhook.core.CallbackProcessor;
 import webhook.core.WebhookManager;
+import webhook.core.WebhookMessageManager;
+import webhook.core.WebhookRecordManager;
 import webhook.dto.WebhookMessageDTO;
 import webhook.dto.WebhookRecordDTO;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.*;
-import java.util.stream.Collectors;
 
 /**
  * Webhook service based on memory
@@ -24,20 +26,24 @@ import java.util.stream.Collectors;
 public class DbWebhookManager implements WebhookManager {
 
     /**
-     * Webhook记录
+     * Webhook记录管理器
      */
-    private final Map<String, WebhookRecordDTO> webhookRecordManager = new ConcurrentHashMap<>();
+    @Resource
+    private WebhookRecordManager webhookRecordManager;
     /**
-     * Webhook消息
+     * Webhook消息管理器
      */
-    private final Map<String, WebhookMessageDTO> webhookMessageManager = new ConcurrentHashMap<>();
+    @Resource
+    private WebhookMessageManager webhookMessageManager;
     /**
      * 回调处理器
      */
-    private final CallbackProcessor callbackProcessor;
+    @Resource
+    private CallbackProcessor callbackProcessor;
     /**
      * 回调处理线程池
      */
+    @Resource
     private ExecutorService callbackProcessorExecutor;
 
     @PostConstruct
@@ -51,23 +57,31 @@ public class DbWebhookManager implements WebhookManager {
         Executors.newSingleThreadExecutor().execute(this::continueCallbackMessage);
     }
 
-    public DbWebhookManager(CallbackProcessor callbackProcessor) {
+    public DbWebhookManager() {
+
+    }
+
+    public DbWebhookManager(CallbackProcessor callbackProcessor,
+                            WebhookRecordManager wrManager,
+                            WebhookMessageManager wmManager) {
         this.callbackProcessor = callbackProcessor;
+        this.webhookRecordManager = wrManager;
+        this.webhookMessageManager = wmManager;
     }
 
     @Override
     public void addWebhookRecord(WebhookRecordDTO wr) {
-        webhookRecordManager.put(wr.getMessageId(), wr);
+        webhookRecordManager.addWebhookRecord(wr);
     }
 
     @Override
     public WebhookRecordDTO getWebhookRecord(String messageId) {
-        return webhookRecordManager.get(messageId);
+        return webhookRecordManager.getWebhookRecord(messageId);
     }
 
     @Override
     public void callbackMessage(String messageId, Map<String, Object> message) {
-        WebhookRecordDTO wr = webhookRecordManager.get(messageId);
+        WebhookRecordDTO wr = webhookRecordManager.getWebhookRecord(messageId);
         Objects.requireNonNull(wr, "WebhookRecord not found");
 
         // 保存消息
@@ -80,7 +94,7 @@ public class DbWebhookManager implements WebhookManager {
         wm.setMessageId(messageId);
         wm.setWebhookUrl(wr.getWebhookUrl());
 
-        webhookMessageManager.put(messageId, wm);
+        webhookMessageManager.addWebhookMessage(wm);
     }
 
     // 持续回调消息
@@ -88,17 +102,15 @@ public class DbWebhookManager implements WebhookManager {
         while (true) {
             try {
                 // 获取需要回调的消息
-                List<WebhookMessageDTO> wms = webhookMessageManager.values().stream()
-                        .filter(m -> m.getNextCallbackTime().isBefore(LocalDateTime.now()))
-                        .collect(Collectors.toList());
+                List<WebhookMessageDTO> wms = webhookMessageManager.fetchReadyWebhookMessage(10);
 
                 // 回调
                 wms.forEach(wm -> callbackProcessorExecutor.execute(() -> this.performCallback(wm)));
             } catch (Exception e) {
-                log.error("Callback message failed", e);
+                log.error("Callback message failed");
             } finally {
                 try {
-                    Thread.sleep(3000);
+                    Thread.sleep(1000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     log.error("Callback message thread interrupted", e);
@@ -115,21 +127,21 @@ public class DbWebhookManager implements WebhookManager {
             callbackProcessor.callback(wm.getWebhookUrl(), wm.getCallbackData());
             wm.setCallbackSuccess(true);
 
-            webhookMessageManager.put(wm.getMessageId(), wm);
+            webhookMessageManager.removeWebhookMessage(wm.getMessageId());
         } catch (Exception e) {
             log.error("Callback message failed");
+            int alreadyCallbackTimes = wm.getAlreadyCallbackTimes() + 1;
 
-            LocalDateTime nextCallbackTime = this.getNextExecuteTime(wm.getAlreadyCallbackTimes());
+            LocalDateTime nextCallbackTime = this.getNextExecuteTime(alreadyCallbackTimes);
             if (nextCallbackTime == null) {
+                log.error("Callback message failed, no more retry");
                 return;
             }
 
-            wm.setCallbackSuccess(false);
-            wm.setFailReason(e.getMessage());
-            wm.setAlreadyCallbackTimes(wm.getAlreadyCallbackTimes() + 1);
-            wm.setNextCallbackTime(nextCallbackTime);
-
-            webhookMessageManager.put(wm.getMessageId(), wm);
+            webhookMessageManager.callbackFailed(wm.getMessageId(),
+                    e.getMessage(),
+                    alreadyCallbackTimes,
+                    nextCallbackTime);
         }
     }
 
